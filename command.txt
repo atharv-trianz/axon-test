@@ -1,0 +1,10 @@
+cd C:\AxonAutomation
+
+python -m pip install -r requirements.txt
+
+$env:AWS_RESOURCE_REGION = "us-east-2"
+$env:SYNC_QUEUE_URL = "https://sqs.us-east-2.amazonaws.com/770410989764/sync-to-axon-jobs"
+$env:AXON_SYNC_TABLE = "AxonSyncJobs"
+$env:AXON_CREDS_SECRET_ARN = "arn:aws:secretsmanager:us-east-2:770410989764:secret:axon-automation-creds-8xqNgf"
+
+python xtmt_worker.py
