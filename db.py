@@ -1,8 +1,4 @@
-"""
-db.py - DynamoDB helper for the AxonSyncJobs table. Same schema used
-by the Trigger/Status Lambdas -- this worker just becomes the sole
-writer of evidence sync results, using XTMT for 100% of uploads.
-"""
+
 import os
 import time
 import boto3

@@ -1,39 +1,4 @@
-"""
-xtmt_worker.py - Windows EC2 worker for the TBI DEMS -> Axon sync
-pipeline. XTMT is the SOLE upload mechanism -- Nova Act / browser
-automation has been fully removed from this architecture.
 
-ARCHITECTURE:
-  DEMS Button -> API Gateway -> Trigger Lambda -> SQS (sync-to-axon-jobs)
-                                                        |
-                                          THIS Windows EC2 Worker (XTMT)
-                                          handles EVERY evidence file,
-                                          any size
-                                                        |
-                                        DynamoDB (AxonSyncJobs)
-                                                        |
-                                     Status Lambda <- polled by DEMS UI
-
-IMPORTANT - MUST RUN WITH A REAL CONSOLE ATTACHED:
-  xtmt_client.py deliberately does NOT capture XTMT's stdout/stderr
-  (this is the confirmed fix for XTMT's console-drawing crash -- see
-  xtmt_client.py's module docstring for the full explanation). This
-  means THIS worker process itself must be running with a real,
-  attached console for that inheritance to work correctly.
-
-  On EC2, this means running xtmt_worker.py inside an actual interactive
-  session (e.g. a persistent RDP session, or a scheduled task configured
-  to "Run only when user is logged on") -- NOT as a headless Windows
-  Service, which has no real console for XTMT to inherit.
-
-SAFETY NOTE: this worker processes REAL DEMS case numbers and evidence
-files. Every upload is validated (case number format), hashed (SHA-256,
-logged before AND implicitly verifiable via the Axon portal after), and
-verified against XTMT's own progress log before being marked SUCCESS in
-DynamoDB. These checks are intentional and should not be removed for
-convenience -- they are what catches a bad case number or a failed
-upload before it's silently treated as done.
-"""
 import os
 import sys
 import json
