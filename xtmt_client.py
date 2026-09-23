@@ -1,63 +1,4 @@
-"""
-xtmt_client.py - Automates Axon's XTMT.exe (bundled inside Upload XT v2)
-for ALL evidence uploads, any file size. This is now the SOLE upload
-mechanism for the DEMS -> Axon pipeline (Nova Act / browser automation
-has been fully removed from this architecture).
 
-============================================================================
-CONFIRMED WORKING FLAGS (validated via many isolated test runs,
-22-24 Sep 2026, against ingest-tbi-test-portal.evidence.com):
-============================================================================
-  -o <operation name>   (required)
-  -p <file path>         (required)
-  -c <case number>       (works for both existing AND new cases)
-  -n                     (create case if new)
-  -a                     (autoRun - skips the Y/N prompt)
-  -t <category>          (optional)
-  -b <batch size>        (optional)
-
-  Case number format: real DEMS case numbers use "YYYY-XXXXXXX"
-  (e.g. "2026-1222112"). This client validates that format before
-  calling XTMT and refuses to proceed otherwise.
-
-============================================================================
-CRITICAL FIX - CONSOLE INHERITANCE (confirmed root cause, 24 Sep 2026):
-============================================================================
-Every command typed DIRECTLY into cmd/PowerShell succeeded, 100% of the
-time. Every command launched PROGRAMMATICALLY with captured/redirected
-stdout FAILED, 100% of the time -- even using the exact same case
-number, file, and flags that had just succeeded manually seconds
-earlier.
-
-XTMT prints a live-updating progress bar:
-    [XXXXXXXXXX]  1/1  100%  C:\\path\\to\\file.pdf
-This requires direct console cursor manipulation (.NET's
-Console.SetCursorPosition or similar). That call THROWS when stdout is
-redirected into a pipe instead of a real console -- exactly what
-capturing stdout does. The thrown exception is what gets surfaced as
-the generic "Error occurred while executing XTMT application
-migration."
-
-FIX: do NOT capture or redirect XTMT's stdout/stderr. Let it inherit
-the calling process's real console. Verify success afterward by
-reading XTMT's own Progress log file instead -- its path is fully
-deterministic based on the operation name:
-    %LOCALAPPDATA%\\Axon\\UploadXT\\XTMT\\Logs\\<operation>\\Progress_<operation>.tsv
-
-IMPORTANT IMPLICATION FOR THE WORKER: because this worker process's own
-console is what gets inherited, xtmt_worker.py MUST be run as a normal
-interactive console application (e.g. via Task Scheduler with "Run only
-when user is logged on", or inside a persistent RDP/console session) --
-NOT as a Windows Service or a fully detached/headless background
-process, since those do not have a real console for XTMT to inherit.
-============================================================================
-
-LOGIN: XTMT requires NO separate login of its own -- it rides on
-whatever session the Upload XT v2 desktop app already has open. See
-ensure_uploadxt_login.py for how that session is established/verified
-before any upload is attempted.
-============================================================================
-"""
 import os
 import re
 import csv
@@ -86,9 +27,7 @@ class XtmtError(RuntimeError):
 
 class XtmtCaseNameError(XtmtError):
     """Raised specifically when the case number doesn't match the
-    required 'YYYY-XXXXXXX' format -- confirmed this format is required
-    for reliable case creation/matching, and non-standard formats have
-    been observed to fail silently."""
+    required 'YYYY-XXXXXXX' format."""
     pass
 
 
@@ -96,8 +35,7 @@ def validate_case_number_format(case_number: str):
     if not CASE_NUMBER_PATTERN.match(case_number):
         raise XtmtCaseNameError(
             f"Case number '{case_number}' does not match the confirmed-working "
-            f"format 'YYYY-XXXXXXX' (e.g. '2026-1222112'). Refusing to proceed -- "
-            f"this exact scenario caused a silent failure during testing."
+            f"format 'YYYY-XXXXXXX' (e.g. '2026-1222112')."
         )
 
 
@@ -112,16 +50,22 @@ def file_sha256(path: str) -> str:
 def _parse_progress_log(progress_log_path: str) -> dict:
     """
     Reads XTMT's own Progress_<operation>.tsv log file to determine REAL
-    success/failure. This is the verification mechanism used INSTEAD of
-    parsing live console output, since capturing that output is what
-    broke XTMT's console-drawing logic in the first place (see module
-    docstring).
+    success/failure.
+
+    FIX (24 Sep 2026): parses the TSV PROPERLY using the header row to
+    locate the actual columns (ItemUploadStatus, ErrorCode, ErrorMessage)
+    and checks the real VALUES in those columns for each data row --
+    instead of the old blind keyword search across the whole raw text,
+    which incorrectly matched the word "error" appearing only in the
+    column HEADER NAMES ("ErrorCode", "ErrorMessage"), even when those
+    columns were correctly empty for a fully successful upload.
     """
     result = {
         "log_found": False,
         "raw_rows": [],
         "likely_success": None,
-        "fail_keywords_found": [],
+        "data_row_statuses": [],
+        "data_row_errors": [],
     }
 
     if not os.path.exists(progress_log_path):
@@ -135,14 +79,58 @@ def _parse_progress_log(progress_log_path: str) -> dict:
         rows = list(reader)
 
     result["raw_rows"] = rows
-    full_text = "\n".join(["\t".join(r) for r in rows]).lower()
-    fail_terms = ["fail", "error", "exception", "denied", "reject"]
-    found_fail_terms = [t for t in fail_terms if t in full_text]
-    result["fail_keywords_found"] = found_fail_terms
 
-    # Conservative signal: log exists, has content, no failure keywords.
-    result["likely_success"] = bool(rows) and not found_fail_terms
+    if not rows:
+        result["likely_success"] = False
+        return result
 
+    header = rows[0]
+    data_rows = rows[1:]
+
+    if not data_rows:
+        # Header present but no actual data rows -- nothing was
+        # recorded as processed, treat as not confirmed successful.
+        logger.warning("Progress log has a header row but no data rows.")
+        result["likely_success"] = False
+        return result
+
+    # Locate the real column indexes by NAME, rather than assuming a
+    # fixed position -- this is robust even if XTMT changes column
+    # order in a future version.
+    def _col_index(col_name: str):
+        for i, h in enumerate(header):
+            if h.strip().lower() == col_name.strip().lower():
+                return i
+        return None
+
+    status_idx = _col_index("ItemUploadStatus")
+    error_code_idx = _col_index("ErrorCode")
+    error_message_idx = _col_index("ErrorMessage")
+
+    all_rows_ok = True
+
+    for row in data_rows:
+        status_val = row[status_idx].strip() if status_idx is not None and status_idx < len(row) else ""
+        error_code_val = row[error_code_idx].strip() if error_code_idx is not None and error_code_idx < len(row) else ""
+        error_message_val = row[error_message_idx].strip() if error_message_idx is not None and error_message_idx < len(row) else ""
+
+        result["data_row_statuses"].append(status_val)
+        result["data_row_errors"].append({"code": error_code_val, "message": error_message_val})
+
+        # A row is only a real failure if it has an actual non-empty
+        # ErrorCode/ErrorMessage VALUE, or an explicit non-success
+        # status. "Done" (confirmed from a real successful run) is
+        # treated as success. Being conservative: if we don't recognize
+        # the status text at all, we do NOT assume success blindly --
+        # we only trust rows that are unambiguously "Done" with no
+        # error values populated.
+        row_has_error_value = bool(error_code_val) or bool(error_message_val)
+        row_status_ok = status_val.lower() in ("done", "success", "completed", "uploaded")
+
+        if row_has_error_value or not row_status_ok:
+            all_rows_ok = False
+
+    result["likely_success"] = all_rows_ok
     return result
 
 
@@ -158,15 +146,10 @@ def upload_evidence_via_xtmt(
     """
     Uploads one evidence file into Axon via XTMT's command-line
     interface, using ONLY the flag combination confirmed safe through
-    isolated testing, and WITHOUT capturing XTMT's stdout/stderr (see
-    module docstring for why this is required).
+    isolated testing, and WITHOUT capturing XTMT's stdout/stderr.
 
     Returns a dict with: success (bool), exit_code, progress_log (dict),
     pre_upload_sha256, operation_name.
-
-    Raises XtmtCaseNameError if case_number isn't in the confirmed
-    -working format, or XtmtError for any other real failure (file
-    missing, XTMT.exe missing, timeout).
     """
     validate_case_number_format(case_number)
 
@@ -199,16 +182,13 @@ def upload_evidence_via_xtmt(
 
     xtmt_working_dir = os.path.dirname(XTMT_PATH)
     logger.info(f"Running XTMT (cwd={xtmt_working_dir}): {' '.join(args)}")
-    logger.info("XTMT output will print directly to this process's own console "
-                "(not captured), so its progress bar can draw correctly.")
+    logger.info("XTMT output will print directly to this process's own console.")
 
     try:
         proc = subprocess.run(
             args,
             cwd=xtmt_working_dir,
             timeout=timeout_seconds,
-            # Deliberately NOT setting stdout/stderr -- letting XTMT
-            # inherit this process's real console is the confirmed fix.
         )
     except subprocess.TimeoutExpired as e:
         raise XtmtError(f"XTMT timed out after {timeout_seconds}s for case {case_number}") from e
@@ -222,11 +202,16 @@ def upload_evidence_via_xtmt(
 
     success = (proc.returncode == 1000) and (parsed["likely_success"] is True)
 
-    if not success:
+    if success:
+        logger.info(
+            f"XTMT upload CONFIRMED successful for case {case_number}. "
+            f"Row statuses: {parsed['data_row_statuses']}"
+        )
+    else:
         logger.error(
             f"XTMT upload NOT confirmed successful for case {case_number}. "
             f"exit_code={proc.returncode}, progress_log_found={parsed['log_found']}, "
-            f"fail_keywords={parsed['fail_keywords_found']}"
+            f"row_statuses={parsed['data_row_statuses']}, row_errors={parsed['data_row_errors']}"
         )
 
     return {
